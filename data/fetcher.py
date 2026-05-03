@@ -1,6 +1,6 @@
 """
 Data Fetcher — yfinance with ETF fallbacks + period retries.
-Handles futures contract rollovers, delisted symbols gracefully.
+All fallback params are keyword-only with defaults so signature is always compatible.
 """
 
 import asyncio
@@ -21,55 +21,51 @@ except ImportError:
     logger.error("yfinance not installed!")
 
 
-# ─── INTERNAL SYNC FUNCTIONS ────────────────────────────────────────────────
+# ─── SYNC HELPERS ────────────────────────────────────────────────────────────
 
-def _fetch_history_single(ticker: str, period: str, interval: str) -> Optional[object]:
-    """Try fetching history for one ticker. Returns DataFrame or None."""
+def _try_fetch(ticker: str, period: str, interval: str):
+    """Return DataFrame or None — never raises."""
     try:
         t    = yf.Ticker(ticker)
         hist = t.history(period=period, interval=interval, auto_adjust=True)
         if hist is not None and not hist.empty and len(hist) >= 20:
             return hist
     except Exception as e:
-        logger.debug(f"yfinance fetch failed {ticker}/{period}: {e}")
+        logger.debug(f"yfinance {ticker}/{period}: {e}")
     return None
 
 
 def _sync_history(ticker: str, period: str, interval: str,
-                  fallbacks: Dict[str, str]) -> dict:
+                  fallbacks: Dict[str, str] = {}) -> dict:
     """
-    Fetch price history with:
-    1. Primary ticker, requested period
-    2. Primary ticker, shorter periods (1y → 6mo → 3mo)
-    3. ETF fallback ticker if primary consistently fails
+    Fetch OHLCV history.
+    Strategy: primary ticker → shorter periods → ETF fallback → raise.
     """
-    # Period fallback chain
-    period_chain = [period]
-    if period == "2y":
-        period_chain = ["2y", "1y", "6mo", "3mo"]
-    elif period == "1y":
-        period_chain = ["1y", "6mo", "3mo"]
+    period_chain = {"2y": ["2y","1y","6mo","3mo"],
+                    "1y": ["1y","6mo","3mo"],
+                    "6mo":["6mo","3mo"]}.get(period, [period, "1y", "6mo"])
 
-    # Try primary ticker across all periods
-    hist = None
+    hist        = None
     used_ticker = ticker
+
+    # 1. Try primary across period chain
     for p in period_chain:
-        hist = _fetch_history_single(ticker, p, interval)
+        hist = _try_fetch(ticker, p, interval)
         if hist is not None:
             break
 
-    # Try ETF fallback if primary failed completely
+    # 2. Try ETF fallback if primary failed
     if hist is None and ticker in fallbacks:
-        fallback = fallbacks[ticker]
-        logger.info(f"Primary {ticker} unavailable — trying fallback {fallback}")
-        used_ticker = fallback
+        fb = fallbacks[ticker]
+        logger.info(f"{ticker} unavailable — trying ETF fallback {fb}")
+        used_ticker = fb
         for p in period_chain:
-            hist = _fetch_history_single(fallback, p, interval)
+            hist = _try_fetch(fb, p, interval)
             if hist is not None:
                 break
 
     if hist is None:
-        raise ValueError(f"No history returned for {ticker} (tried fallbacks too)")
+        raise ValueError(f"No history returned for {ticker} (tried all periods + fallbacks)")
 
     hist = hist.dropna(subset=["Close"])
 
@@ -82,7 +78,7 @@ def _sync_history(ticker: str, period: str, interval: str,
 
     returns = []
     for i in range(1, len(closes)):
-        r = (closes[i] - closes[i-1]) / closes[i-1] if closes[i-1] else 0
+        r = (closes[i] - closes[i-1]) / closes[i-1] if closes[i-1] else 0.0
         returns.append(round(r, 8))
 
     return {
@@ -101,54 +97,51 @@ def _sync_history(ticker: str, period: str, interval: str,
 
 
 def _sync_quote(ticker: str, display_name: str,
-                fallbacks: Dict[str, str]) -> dict:
-    """Fetch current quote, falling back to ETF if needed."""
+                fallbacks: Dict[str, str] = {}) -> dict:
+    """Fetch real-time quote with ETF fallback."""
     used_ticker = ticker
-    info        = None
+    price       = 0.0
 
-    # Try primary
+    def _get_price(tk):
+        t = yf.Ticker(tk)
+        i = t.fast_info
+        return float(getattr(i, "last_price", 0) or 0), i
+
     try:
-        t    = yf.Ticker(ticker)
-        info = t.fast_info
-        price = float(getattr(info, "last_price", 0) or 0)
+        price, info = _get_price(ticker)
         if price <= 0:
-            raise ValueError("Zero price")
+            raise ValueError("zero price")
     except Exception:
-        # Try fallback
         if ticker in fallbacks:
             used_ticker = fallbacks[ticker]
             try:
-                t     = yf.Ticker(used_ticker)
-                info  = t.fast_info
-                price = float(getattr(info, "last_price", 0) or 0)
+                price, info = _get_price(used_ticker)
             except Exception as e:
                 raise ValueError(f"Both {ticker} and {used_ticker} failed: {e}")
         else:
-            raise ValueError(f"Cannot fetch quote for {ticker}")
+            # Return placeholder so UI doesn't break
+            return _placeholder_quote(display_name, ticker)
 
-    price   = float(getattr(info, "last_price",      0) or 0)
-    open_   = float(getattr(info, "open",             price) or price)
-    high    = float(getattr(info, "day_high",         price) or price)
-    low_    = float(getattr(info, "day_low",          price) or price)
-    prev    = float(getattr(info, "previous_close",   price) or price)
-    volume  = float(getattr(info, "three_month_average_volume", 0) or 0)
+    open_  = float(getattr(info, "open",           price) or price)
+    high   = float(getattr(info, "day_high",       price) or price)
+    low_   = float(getattr(info, "day_low",        price) or price)
+    prev   = float(getattr(info, "previous_close", price) or price)
+    volume = float(getattr(info, "three_month_average_volume", 0) or 0)
+    chg    = price - prev
+    chg_pct= (chg / prev * 100) if prev else 0.0
 
-    chg     = price - prev
-    chg_pct = (chg / prev * 100) if prev else 0.0
-
-    # 30-day history for indicators
+    # Technical indicators from 30d history
+    ann_vol = rsi_val = adx_val = sharpe = 0.0
     try:
-        hist = yf.Ticker(used_ticker).history(period="30d", interval="1d", auto_adjust=True)
-        if len(hist) >= 5:
-            ret     = hist["Close"].pct_change().dropna()
+        h30 = yf.Ticker(used_ticker).history(period="30d", interval="1d", auto_adjust=True)
+        if len(h30) >= 5:
+            ret     = h30["Close"].pct_change().dropna()
             ann_vol = float(ret.std() * np.sqrt(252) * 100)
-            rsi_val = _compute_rsi(hist["Close"].tolist())
-            adx_val = _compute_adx(hist)
+            rsi_val = _compute_rsi(h30["Close"].tolist())
+            adx_val = _compute_adx(h30)
             sharpe  = _compute_sharpe(ret)
-        else:
-            ann_vol = rsi_val = adx_val = sharpe = 0.0
     except Exception:
-        ann_vol = rsi_val = adx_val = sharpe = 0.0
+        pass
 
     return {
         "symbol":     display_name,
@@ -169,7 +162,19 @@ def _sync_quote(ticker: str, display_name: str,
     }
 
 
-# ─── ASYNC WRAPPER ──────────────────────────────────────────────────────────
+def _placeholder_quote(display_name: str, ticker: str) -> dict:
+    """Return a zero quote when data is unavailable — prevents 500 errors."""
+    return {
+        "symbol": display_name, "ticker": ticker,
+        "price": 0.0, "open": 0.0, "high": 0.0, "low": 0.0,
+        "prev_close": 0.0, "change": 0.0, "change_pct": 0.0,
+        "volume": 0, "ann_vol": 0.0, "rsi": 50.0, "adx": 0.0, "sharpe": 0.0,
+        "timestamp": datetime.utcnow().isoformat(),
+        "note": "Data temporarily unavailable",
+    }
+
+
+# ─── ASYNC CLASS ─────────────────────────────────────────────────────────────
 
 class DataFetcher:
 
@@ -186,7 +191,6 @@ class DataFetcher:
             _executor, _sync_history, ticker, period, interval, fallbacks)
 
     def future_dates(self, last_date_str: str, steps: int) -> List[str]:
-        """Generate business-day dates forward from last known date."""
         try:
             last = datetime.strptime(last_date_str, "%Y-%m-%d")
         except Exception:
@@ -199,7 +203,7 @@ class DataFetcher:
         return dates
 
 
-# ─── TECHNICAL INDICATORS ───────────────────────────────────────────────────
+# ─── TECHNICAL INDICATORS ────────────────────────────────────────────────────
 
 def _compute_rsi(closes: list, period: int = 14) -> float:
     if len(closes) < period + 1:
@@ -207,8 +211,7 @@ def _compute_rsi(closes: list, period: int = 14) -> float:
     gains, losses = [], []
     for i in range(1, len(closes)):
         d = closes[i] - closes[i-1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
     ag = np.mean(gains[-period:])
     al = np.mean(losses[-period:])
     return float(100 - 100 / (1 + ag / (al + 1e-9)))
@@ -216,33 +219,28 @@ def _compute_rsi(closes: list, period: int = 14) -> float:
 
 def _compute_adx(hist, period: int = 14) -> float:
     try:
-        high  = hist["High"].values
-        low   = hist["Low"].values
-        close = hist["Close"].values
-        n     = len(close)
+        hi, lo, cl = hist["High"].values, hist["Low"].values, hist["Close"].values
+        n = len(cl)
         if n < period + 2:
             return 25.0
-        tr_list, pdm_list, ndm_list = [], [], []
+        tr_l, pdm_l, ndm_l = [], [], []
         for i in range(1, n):
-            tr  = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
-            pdm = max(high[i]-high[i-1], 0)
-            ndm = max(low[i-1]-low[i],   0)
+            tr  = max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
+            pdm = max(hi[i]-hi[i-1], 0); ndm = max(lo[i-1]-lo[i], 0)
             if pdm > ndm:   ndm = 0
             elif ndm > pdm: pdm = 0
             else:           pdm = ndm = 0
-            tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
-        atr  = np.mean(tr_list[-period:])
-        apdi = np.mean(pdm_list[-period:]) / (atr + 1e-9) * 100
-        andi = np.mean(ndm_list[-period:]) / (atr + 1e-9) * 100
-        dx   = abs(apdi - andi) / (apdi + andi + 1e-9) * 100
-        return float(np.clip(dx, 0, 100))
+            tr_l.append(tr); pdm_l.append(pdm); ndm_l.append(ndm)
+        atr  = np.mean(tr_l[-period:])
+        apdi = np.mean(pdm_l[-period:]) / (atr + 1e-9) * 100
+        andi = np.mean(ndm_l[-period:]) / (atr + 1e-9) * 100
+        return float(np.clip(abs(apdi-andi) / (apdi+andi+1e-9) * 100, 0, 100))
     except Exception:
         return 25.0
 
 
 def _compute_sharpe(returns, rf_annual: float = 0.05) -> float:
-    r  = np.array(returns, dtype=float)
-    rf = rf_annual / 252
+    r = np.array(returns, dtype=float)
     if r.std() < 1e-9:
         return 0.0
-    return float((r.mean() - rf) / r.std() * np.sqrt(252))
+    return float((r.mean() - rf_annual/252) / r.std() * np.sqrt(252))
